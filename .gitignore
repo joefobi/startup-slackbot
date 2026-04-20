@@ -1,0 +1,40 @@
+# Environment
+.env
+.env.local
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3*
+*.sqlite*
+*.db*
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+.venv/
+venv/
+env/
+
+# LangSmith / LangChain cache
+.langchain.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+
+# Logs
+*.log
+CLAUDE.md
