@@ -4,7 +4,7 @@
 
 This document describes a Slack chatbot that answers questions grounded in a SQLite database containing structured startup data and long-form artifacts in the form of call transcripts, internal communications, support tickets, etc.
 
-The bot uses a LangGraph outer pipeline plus an inner LangChain `create_agent` ReAct loop with a hybrid retrieval strategy: keyword search (BM25 via SQLite FTS5) combined with semantic vector search (sqlite-vec), merged with Reciprocal Rank Fusion. Structured questions are answered with SQL; document questions with FTS + vector search. The LLM decides which tools to call and in what order based on intermediate results, rather than following a fixed pipeline.
+The bot uses a LangGraph outer pipeline plus an inner LangChain `create_agent` ReAct loop with a hybrid retrieval strategy of keyword search (BM25 via SQLite FTS5) combined with semantic vector search (sqlite-vec), merged with Reciprocal Rank Fusion. Structured questions are answered with SQL and document questions with FTS + vector search. The LLM decides which tools to call and in what order based on intermediate results.
 
 ## Architecture
 
@@ -19,7 +19,7 @@ prepare_react_node          (clears ReAct messages, injects summary / recent_tur
   ▼
 react_agent_graph           LangChain create_agent: internal LLM ↔ tools loop
   │   ┌──────────────────────────────────────────────┐
-  │   │  LLM → tool_calls? → hybrid_search           │
+  │   │  LLM → if tool_calls are needed → hybrid_search           │
   │   │                   → run_sql                  │
   │   │       no tool_calls → exit subgraph          │
   │   └──────────────────────────────────────────────┘
@@ -39,28 +39,20 @@ END
 
 `prepare_react_node` runs once per Slack message. It wipes the prior turn's ReAct `messages` so tool traces do not accumulate forever, and it fills a fresh user message from `summary`, `recent_turns`, and the current `question`. 
 
-`react_agent_graph` is the compiled subgraph from `create_agent`. The LLM decides which tools to call and in what order from each observation. The loop ends when the LLM returns with no tool calls, or when `MAX_REACT_ITERATIONS` is reached. Retrieval outputs land on unified checkpoint state (`UnifiedGraphState`) so `answer_node` can read `fts_results`, `sql_results`, `messages`, etc.
+`react_agent_graph` is the compiled subgraph from `create_agent`. The LLM decides which tools to call and in what order from each observation. The loop ends when the LLM returns with no tool calls, or when `MAX_REACT_ITERATIONS` is reached. Retrieval outputs are provided on a unified checkpoint state (`UnifiedGraphState`) so `answer_node` can read outputs from `react_agent_graph`.
 
 ### Node Responsibilities
 
-
-| Node                  | Role                                                                                                                   | LLM?                    |
-| --------------------- | ---------------------------------------------------------------------------------------------------------------------- | ----------------------- |
-| `prepare_react_node`  | Turn boundary: reset ReAct `messages`, clear stale retrieval fields, inject USER_PROMPT from memory + question        | No                      |
-| `react_agent_graph`   | Tool loop: `hybrid_search` / `run_sql`, accumulates results in state                                                  | Yes (tool calls)        |
-| `answer_node`         | Grounded answer from retrieval + structured confidence; also tallies `react_iterations` / `tool_call_count` for evals | Yes (structured output) |
-| `synthesize_node`     | Formats answer as Slack markdown with citations                                                                        | Yes (plain text)        |
-| `update_summary_node` | Evicts oldest verbatim turn, compresses to rolling summary                                                             | Yes (plain text)        |
-
+- **`prepare_react_node`**: reset ReAct `messages`, clear stale retrieval fields, inject USER_PROMPT from memory + question.
+- **`react_agent_graph`**: Tool loop calling `hybrid_search` and `run_sql`; accumulates results in state. 
+- **`answer_node`**: Grounded answer from retrieval plus structured confidence; tallies `react_iterations` / `tool_call_count` for evals. 
+- **`synthesize_node`**: Formats answer as Slack markdown with citations. 
+- **`update_summary_node`**: Evicts oldest verbatim turn, compresses to rolling summary.
 
 **Tools inside `react_agent_graph`:**
 
-
-| Tool            | Role                                                                                                                   |
-| --------------- | ---------------------------------------------------------------------------------------------------------------------- |
-| `hybrid_search` | BM25 (FTS5) + kNN vector search + RRF merge, fetches full `content_text` for top results, writes `fts_results`        |
-| `run_sql`       | SQL plan + validate + execute + correct loop, writes `sql_results`, `generated_sql`                                    |
-
+- **`hybrid_search`**: BM25 (FTS5) + kNN vector search + RRF merge
+- **`run_sql`**: SQL plan + validate + execute + correct loop
 
 ---
 
@@ -70,9 +62,9 @@ END
 
 I observed that answerable questions could fall into three categories:
 
-1. **Structured**: "Which accounts are at risk?" → SQL against `implementations`, `customers`, etc.
-2. **Unstructured**: "What did the team say about the taxonomy rollout?" → Document search over `artifacts`.
-3. **Hybrid**: "Which customer is most likely to churn to a cheaper competitor?" → SQL for structured risk signals + FTS for call transcript context.
+1. **Structured**: "Which accounts are at risk?" requires SQL against `implementations`, `customers`, etc.
+2. **Unstructured**: "What did the team say about the taxonomy rollout?" requires a document search over `artifacts`.
+3. **Hybrid**: "Which customer is most likely to churn to a cheaper competitor?" requires both SQL for structured risk signals and FTS for call transcript context.
 
 The sequential pipeline of fts/hybrid then sql covers all three cases.
 
@@ -80,7 +72,7 @@ The sequential pipeline of fts/hybrid then sql covers all three cases.
 
 BM25 (FTS5) works for exact-match retrieval for proper nouns, product names, and technical terms but fails on paraphrases.
 
-Vector search (sqlite-vec with `text-embedding-ada-002`) handles semantic similarity, and can catch cases where the user's phrasing differs from the document's vocabulary.
+Vector search (sqlite-vec with `text-embedding-ada-002`) handles semantic similarity and can catch cases where the user's phrasing differs from the document's vocabulary.
 
 The two lists are merged with **Reciprocal Rank Fusion (k=60)**:
 
@@ -88,13 +80,13 @@ The two lists are merged with **Reciprocal Rank Fusion (k=60)**:
 score(doc) = Σ  1 / (60 + rank_i)
 ```
 
-A document appearing in both lists gets contributions from both terms. This can then produce results that are both keyword-relevant and semantically relevant.
+A document that appears in both lists gets contributions from both terms. This can then produce results that are both keyword-relevant and semantically relevant.
 
 ### FTS Before SQL
 
 When questions mention customer or competitor names, the agent prompt instructs the LLM to call `hybrid_search` first. The observation it returns includes `customer_id`, `competitor_id`, and other relational IDs extracted from the matched artifacts. The LLM then passes those IDs explicitly to `run_sql` as entity filters, which scopes the SQL query to the accounts that appeared in document search rather than relying on imprecise name-matching with LIKE.
 
-In the ReAct architecture, this order is prompt-guided: the agent system prompt and few-shot examples illustrate the FTS-first pattern, and the LLM applies it when the question warrants it.
+In the ReAct architecture, the agent system prompt and few-shot examples illustrate the FTS-first pattern, and the LLM applies it when the question warrants it.
 
 The `run_sql` tool receives a schema block with `artifacts` and `artifacts_fts` excluded, and the SQL few-shot examples contain no FTS patterns, so the LLM cannot accidentally write FTS queries through the SQL tool.
 
@@ -120,7 +112,6 @@ The `run_sql` tool runs these checks before executing any query:
 2. **Table allowlist**: every table referenced in FROM/JOIN must be in `KNOWN_TABLES`. This was done to catch any hallucinated table names are caught here before execution.
 3. **SELECT-only guard**: prevents non-SELECT queires from running to prevent editing of the db.
 
-
 ### Retry Loop (max 3)
 
 If validation fails or execution raises an error, the tool rewrites the SQL using the error message as context. This loop runs up to `SQL_MAX_RETRIES` times. At the limit, `sql_aborted=True` is set and the tool returns an error observation. The agent can still generate a partial answer from FTS results.
@@ -133,13 +124,13 @@ If validation fails or execution raises an error, the tool rewrites the SQL usin
 
 Each node gets only the prompt it needs. Static system prompts are stored in `StartupContext` once at boot. The `run_sql` tool is the only tool that calls `build_system_prompt(schema_block, FEW_SHOT_EXAMPLES)` at request time with the schema filtered to the tables the LLM said it needed, so the SQL LLM only sees the tables relevant to the current query.
 
-The retrieval agent runs under `prompts/agent.py`, which describes the two tools, when to use each, the FTS-before-SQL strategy, and when to stop retrieving. `answer_node` runs under a separate answer prompt (`prompts/answer.py`) with thoroughness and grounding rules. These two prompts are intentionally distinct because the agent prompt optimises for retrieval decisions and the answer prompt optimises for answer quality. 
+The retrieval agent runs under `prompts/agent.py`, which describes the two tools, when to use each, the FTS-before-SQL strategy, and when to stop retrieving. `answer_node` runs under a separate answer prompt (`prompts/answer.py`). These two prompts are intentionally distinct because the agent prompt optimises for retrieval decisions and the answer prompt optimises for answer quality. 
 
 I observed more fine-grained, better-grounded final answers when I split that second step out as a dedicated `answer_node` with its own prompt and structured output, instead of treating the ReAct loop's last assistant message as the user-facing reply. That said, a separate answer pass is not 100% required for correctness. You could ship the subgraph's exit text straight to Slack for fewer tokens and lower latency; the dedicated node is a quality and control knob I kept because it consistently helped on the eval cases.
 
 ### Few-Shot Examples
 
-There are 12 annotated examples for the `run_sql` tool covering patterns that tend to go wrong:
+There are 12 annotated examples for the `run_sql` tool covering patterns that I observed to be problematic:
 
 - `LOWER(col) LIKE '%value%'` for free-text status fields
 - `json_each()` for JSON array columns (`risks_json`, `success_metrics_json`, `strengths_json`)
@@ -188,7 +179,7 @@ Slack requires an HTTP 200 within 3 seconds or it retries the event. The handler
 ### UX for Slow Responses
 
 1. `:thinking_face:` reaction is added to the user's message immediately.
-2. A `_Thinking..._` placeholder is posted in the thread immediately (no delay).
+2. A `_Thinking..._` placeholder is posted in the thread immediately.
 3. The placeholder is updated in-place with a human-readable status string as outer nodes and tool starts complete (throttled to one Slack API call per second to stay within rate limits).
 4. When the agent finishes, the placeholder is replaced with the real answer via `chat_update`.
 5. Answers over `SLACK_CHAR_LIMIT` (3,800) characters are split at `[CONTINUED]` markers and posted as follow-up messages in the same thread.
@@ -211,7 +202,7 @@ Slack requires an HTTP 200 within 3 seconds or it retries the event. The handler
 CTX: StartupContext = build_startup_context(_db_path)
 ```
 
-This singleton is imported by every node. It holds:
+This is imported by every node. It contains:
 
 - The read-only DB connection
 - The writable vector DB connection
@@ -221,7 +212,7 @@ This singleton is imported by every node. It holds:
 - `react_agent_graph` (compiled `create_agent` subgraph) and `react_agent_prompt`
 - System prompts for `answer_node`, `synthesize_node`, `update_summary_node`
 
-Nothing is re-initialized per request. Schema introspection (including `SELECT DISTINCT` queries for bounded-value column annotations) and static prompt assembly happen once at boot and are reused for every LLM call. The `run_sql` tool builds its prompt dynamically per request with the schema filtered to the tables the agent asked for.
+Nothing is re-initialized per request. Schema introspection (including `SELECT DISTINCT` queries for bounded-value column annotations) and static prompt assembly happen once at boot and are reused for every LLM call. The `run_sql` tool builds its prompt dynamically per request with the schema filtered to the tables the agent needs.
 
 ---
 
@@ -235,19 +226,18 @@ Nothing is re-initialized per request. Schema introspection (including `SELECT D
 - **Iterations**: LLM rounds in the ReAct loop from `run.outputs["react_iterations"]`.
 - **Confidence**: numeric mapping of the confidence string from `answer_node` (high=1.0, medium=0.5, low=0.0).
 
-
 ---
 
 ## Key Tradeoffs Summary
 
 
-| Decision                                     | Alternative                              | Why this way                                                                                                                                                               |
-| -------------------------------------------- | ---------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Dedicated `answer_node` after retrieval      | Use the ReAct subgraph's last assistant message as the reply | I saw finer, more grounded outputs with a purpose-built answer prompt and structured confidence. Not strictly required (you could stream the loop exit text and save a call), but worth it for quality on the evals I ran. |
-| BM25 + vector hybrid                         | Pure BM25 or pure vector                 | BM25 for exact names; vector for paraphrases. Hybrid covers both.                                                                                                          |
-| Per-call schema filtering                    | Full schema always                       | LLM only sees tables relevant to the current query, which reduces hallucination surface.                                                                                   |
-| Verbatim window + rolling summary            | Full history                             | O(1) token cost per turn. Precision loss on old turns is acceptable for Q&A.                                                                                               |
-| Always load full content in `hybrid_search`  | Separate `load_artifacts` tool call      | One fewer round-trip per turn. The LLM sees full document text in the same observation as the search results, which produces more grounded answers without an extra tool invocation. |
+| Decision                                    | Alternative                                                  | Why this way                                                                                                                                                                                                               |
+| ------------------------------------------- | ------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Dedicated `answer_node` after retrieval     | Use the ReAct subgraph's last assistant message as the reply | I saw finer, more grounded outputs with a purpose-built answer prompt and structured confidence. Not strictly required (you could stream the loop exit text and save a call), but worth it for quality on the evals I ran. |
+| BM25 + vector hybrid                        | Pure BM25 or pure vector                                     | BM25 for exact names; vector for paraphrases. Hybrid covers both.                                                                                                                                                          |
+| Per-call schema filtering                   | Full schema always                                           | LLM only sees tables relevant to the current query, which reduces hallucination surface.                                                                                                                                   |
+| Verbatim window + rolling summary           | Full history                                                 | O(1) token cost per turn. Precision loss on old turns is acceptable for Q&A.                                                                                                                                               |
+| Always load full content in `hybrid_search` | Separate `load_artifacts` tool call                          | One fewer round-trip per turn. The LLM sees full document text in the same observation as the search results, which produces more grounded answers without an extra tool invocation.                                       |
 
 
 ---
