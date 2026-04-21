@@ -24,7 +24,6 @@ BM25 works for exact names but fails on paraphrases. I tried a pure FTS solution
 When a question mentions a customer or competitor name, the agent calls `hybrid_search` first. The results include relational IDs extracted from matched artifacts. The LLM then passes those IDs to the SQL tool as filters. This scopes the query to specific accounts rather than relying on imprecise name-matching. By excluding FTS tables from the SQL schema, I ensured the LLM cannot accidentally write invalid FTS queries through the SQL tool.
 
 ## SQL Safety and Validation
- I have implemented three layers to navigate the gap between a model's output and clinical or data safety.
 
 * The database is opened with `mode=ro`. Any non-SELECT statement raises an error at the SQLite level.
 * The tool plans the query with `EXPLAIN` to catch syntax errors. It also checks every table against an allowlist to stop the model from hallucinating table names.
