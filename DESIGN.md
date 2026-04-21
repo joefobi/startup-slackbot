@@ -7,6 +7,8 @@ This document describes a chatbot built to answer questions from a SQLite databa
 
 ## Architecture
 
+START -> `prepare_react_node` -> `react_agent_graph` (calls hybrid search and sql tools in a loop) -> `answer_node` -> `synthesize_node` -> `update_summary_node` -> END
+
 The **`prepare_react_node`** runs once per message to clear prior tool traces. It fills a fresh message from the summary and the current question. Then it enters the **`react_agent_graph`**. The loop ends only when the LLM returns with no tool calls or reaches the iteration limit. 
 
 ### Node Responsibilities
